@@ -2,8 +2,7 @@
 
 A Windows desktop application that automatically downloads background videos for Clone Hero songs from YouTube and converts them to the required `.webm` format with VP8 codec.
 
-![Clone Hero Video Downloader](https://raw.githubusercontent.com/wiki/DragonForce/CloneHeroVideoDownloader/screenshot.png)
-
+![Clone Hero Video Downloader]
 ## Features
 
 - Modern UI with light/dark theme support
@@ -16,7 +15,6 @@ A Windows desktop application that automatically downloads background videos for
 - Option to select video quality (360p, 480p, 720p, 1080p)
 - Auto-fetch mode to automatically select the first result
 - Skip or overwrite existing videos, with "Skip All" option
-- No console windows appear during execution
 
 ## Requirements
 
@@ -44,7 +42,7 @@ After setup completes, you can run the application using `run_downloader.bat`.
 
 For users without Python installed:
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/CloneHeroVideoDownloader/releases) page
+1. Download the latest release from the [Releases](https://github.com/Shonitbar/CloneHeroVideoDownloader/releases) page
 2. Extract the ZIP file
 3. Run `CloneHeroVideoDownloader.exe`
 
@@ -94,7 +92,6 @@ If you prefer to install dependencies manually:
 - The app uses the song folder name as the YouTube search query
 - Downloaded videos are automatically converted to WebM with VP8 codec
 - Temporary files are cleaned up after processing
-- The standalone executable hides all console windows for a cleaner experience
 
 ## Troubleshooting
 
