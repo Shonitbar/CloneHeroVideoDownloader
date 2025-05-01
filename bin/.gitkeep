@@ -1,0 +1,2 @@
+# This file exists to keep the bin directory in git
+# ffmpeg.exe and ffprobe.exe will be downloaded here by setup.py 

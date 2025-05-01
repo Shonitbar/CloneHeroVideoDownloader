@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.spec
+*.exe
+CloneHeroVideoDownloader/
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Project-specific files
+temp_*
+bundled_ffmpeg.py
+main_temp.py
+
+# Downloaded ffmpeg binaries (users will download these via setup.py)
+bin/ffmpeg.exe
+bin/ffprobe.exe
+
+# Temporary files
+**/temp_*/
+**/tmp_*/
+
+# Downloaded videos
+*.mp4
+*.webm
+*.mkv
+*.avi
+
+# Temporary Python scripts
+main_temp.py
+bundled_ffmpeg.py 

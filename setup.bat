@@ -1,0 +1,3 @@
+@echo off
+echo Running Clone Hero Video Downloader Setup...
+python setup.py 
