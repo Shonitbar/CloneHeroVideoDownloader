@@ -2,7 +2,7 @@
 
 A Windows desktop application that automatically downloads background videos for Clone Hero songs from YouTube and converts them to the required `.webm` format with VP8 codec.
 
-![Clone Hero Video Downloader]
+Clone Hero Video Downloader
 ## Features
 
 - Modern UI with light/dark theme support
