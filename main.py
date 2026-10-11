@@ -30,6 +30,34 @@ def create_hidden_process(cmd, **kwargs):
     
     return subprocess.Popen(cmd, **kwargs)
 
+# Extract video ID from different YouTube URL formats
+def extract_video_id(url):
+    # Regular YouTube URL: https://www.youtube.com/watch?v=VIDEO_ID
+    match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    # Shortened URL: https://youtu.be/VIDEO_ID
+    match = re.search(r'youtu\.be/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    # Embed URL: https://www.youtube.com/embed/VIDEO_ID
+    match = re.search(r'youtube\.com/embed/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+
+    return None
+
+# Optional: automatic video_start_time sync (needs numpy + scipy)
+try:
+    import sync_video
+    SYNC_AVAILABLE = True
+except ImportError as e:
+    sync_video = None
+    SYNC_AVAILABLE = False
+    SYNC_UNAVAILABLE_REASON = str(e)
+
 # Set customtkinter appearance
 ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -38,11 +66,11 @@ class CloneHeroVideoDownloader:
     def __init__(self, root):
         self.root = root
         self.root.title("Clone Hero Video Downloader")
-        self.root.geometry("800x600")
-        self.root.minsize(650, 500)
+        self.root.geometry("800x680")
         
         self.songs_folder = ""
         self.video_quality = "720"
+        self.cookies_browser = None  # e.g. "chrome", "firefox" - for age-restricted videos
         self.song_folders = []
         self.current_song_index = 0
         self.processing = False
@@ -50,6 +78,10 @@ class CloneHeroVideoDownloader:
         self.dialog_active = False  # Flag to track if a dialog is currently open
         self.auto_fetch = False  # Flag for auto-fetch mode
         self.skip_conversion = False  # Flag to skip current conversion
+        self.auto_sync = SYNC_AVAILABLE
+        self.sync_overwrite = False
+        self.sync_min_prominence = 6.0 if not SYNC_AVAILABLE else sync_video.DEFAULT_MIN_PROMINENCE
+        self.sync_flagged = []  # (song_name, SyncResult) needing manual review
         
         # Create a flag for ffmpeg path
         self.ffmpeg_path = "ffmpeg"  # default to system path
@@ -68,7 +100,14 @@ class CloneHeroVideoDownloader:
             print(f"Warning: Could not set ffmpeg path: {e}")
         
         self.setup_ui()
-        
+
+        # Size the minimum height to the layout. If the window is shorter than
+        # the sidebar needs, grid takes the shortfall from the weighted
+        # Auto-fetch row and the checkbox shrinks to nothing.
+        self.root.update_idletasks()
+        scaling = ctk.ScalingTracker.get_window_scaling(self.root)
+        self.root.minsize(650, int(self.root.winfo_reqheight() / scaling) + 1)
+
     def setup_ui(self):
         # Configure grid layout (4x4)
         self.root.grid_columnconfigure(1, weight=1)
@@ -104,15 +143,68 @@ class CloneHeroVideoDownloader:
                                            command=self.toggle_auto_fetch,
                                            onvalue=True, offvalue=False)
         self.auto_fetch_cb.grid(row=4, column=0, padx=20, pady=10, sticky="n")
-        
+
+        # Browser cookies selection (needed for age-restricted videos)
+        self.cookies_label = ctk.CTkLabel(self.sidebar_frame, text="Cookies From Browser:")
+        self.cookies_label.grid(row=5, column=0, padx=20, pady=(10, 0))
+
+        self.cookies_combobox = ctk.CTkComboBox(self.sidebar_frame,
+                                               values=["None", "chrome", "firefox", "edge",
+                                                       "brave", "opera", "vivaldi", "chromium"])
+        self.cookies_combobox.grid(row=6, column=0, padx=20, pady=(5, 10))
+        self.cookies_combobox.set("None")  # default: don't use any browser's cookies
+
+        # Cookies.txt file (overrides the browser dropdown above when set; needed
+        # when the browser's live cookie store can't be read/decrypted directly,
+        # e.g. Chrome's App-Bound Encryption on Windows)
+        self.cookies_file_label = ctk.CTkLabel(self.sidebar_frame, text="Or Cookies File:")
+        self.cookies_file_label.grid(row=7, column=0, padx=20, pady=(10, 0))
+
+        self.cookies_file_path = ""
+        self.cookies_file_btn = ctk.CTkButton(self.sidebar_frame, text="Browse...",
+                                            command=self.select_cookies_file,
+                                            width=100)
+        self.cookies_file_btn.grid(row=8, column=0, padx=20, pady=(5, 10))
+
+        # Video sync: estimate video_start_time from the audio after each download
+        self.sync_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.sync_frame.grid(row=9, column=0, padx=15, pady=(10, 5), sticky="ew")
+        self.sync_frame.grid_columnconfigure(0, weight=1)
+
+        self.sync_label = ctk.CTkLabel(self.sync_frame, text="Video Sync",
+                                      font=ctk.CTkFont(weight="bold"))
+        self.sync_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.auto_sync_var = ctk.BooleanVar(value=SYNC_AVAILABLE)
+        self.auto_sync_cb = ctk.CTkCheckBox(self.sync_frame, text="Auto-sync offset",
+                                          variable=self.auto_sync_var)
+        self.auto_sync_cb.grid(row=1, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.sync_overwrite_var = ctk.BooleanVar(value=False)
+        self.sync_overwrite_cb = ctk.CTkCheckBox(self.sync_frame, text="Overwrite existing",
+                                               variable=self.sync_overwrite_var)
+        self.sync_overwrite_cb.grid(row=2, column=0, columnspan=2, padx=10, pady=(5, 0), sticky="w")
+
+        self.sync_min_prominence_label = ctk.CTkLabel(self.sync_frame, text="Min confidence:")
+        self.sync_min_prominence_label.grid(row=3, column=0, padx=(10, 5), pady=5, sticky="w")
+        self.sync_min_prominence_var = tk.StringVar(value=str(self.sync_min_prominence))
+        self.sync_min_prominence_entry = ctk.CTkEntry(self.sync_frame, width=50,
+                                                     textvariable=self.sync_min_prominence_var)
+        self.sync_min_prominence_entry.grid(row=3, column=1, padx=(0, 10), pady=5, sticky="e")
+
+        if not SYNC_AVAILABLE:
+            for widget in (self.auto_sync_cb, self.sync_overwrite_cb, self.sync_min_prominence_entry):
+                widget.configure(state="disabled")
+            self.sync_label.configure(text="Video Sync (needs numpy + scipy)")
+
         # Appearance mode switcher
         self.appearance_mode_label = ctk.CTkLabel(self.sidebar_frame, text="Appearance Mode:")
-        self.appearance_mode_label.grid(row=5, column=0, padx=20, pady=(10, 0))
-        
-        self.appearance_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame, 
+        self.appearance_mode_label.grid(row=10, column=0, padx=20, pady=(10, 0))
+
+        self.appearance_mode_menu = ctk.CTkOptionMenu(self.sidebar_frame,
                                                  values=["System", "Light", "Dark"],
                                                  command=self.change_appearance_mode)
-        self.appearance_mode_menu.grid(row=6, column=0, padx=20, pady=(5, 10))
+        self.appearance_mode_menu.grid(row=11, column=0, padx=20, pady=(5, 10))
         
         # Create main frame
         self.main_frame = ctk.CTkFrame(self.root)
@@ -188,7 +280,17 @@ class CloneHeroVideoDownloader:
             self.songs_folder = folder
             self.folder_path_var.set(folder)
             self.log(f"Selected folder: {folder}")
-    
+
+    def select_cookies_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select cookies.txt (Netscape format)",
+            filetypes=[("Cookies file", "*.txt"), ("All files", "*.*")])
+        if file_path:
+            self.cookies_file_path = file_path
+            # Show just the filename on the button so the sidebar stays narrow
+            self.cookies_file_btn.configure(text=os.path.basename(file_path))
+            self.log(f"Using cookies file: {file_path}")
+
     def log(self, message, verbose=True):
         """Log a message to the UI log and console"""
         if verbose:
@@ -214,7 +316,17 @@ class CloneHeroVideoDownloader:
         # Get selected video quality (strip "p" from the end)
         self.video_quality = self.quality_combobox.get().replace("p", "")
         self.auto_fetch = self.auto_fetch_var.get()
-        
+        cookies_choice = self.cookies_combobox.get()
+        self.cookies_browser = None if cookies_choice == "None" else cookies_choice
+        self.auto_sync = SYNC_AVAILABLE and self.auto_sync_var.get()
+        self.sync_overwrite = self.sync_overwrite_var.get()
+        try:
+            self.sync_min_prominence = float(self.sync_min_prominence_var.get())
+        except ValueError:
+            self.show_error_dialog("Sync min confidence must be a number (default 6.0).")
+            return
+        self.sync_flagged = []
+
         # Reset progress
         self.current_song_index = 0
         self.progress_bar.set(0)
@@ -313,10 +425,12 @@ class CloneHeroVideoDownloader:
             self.root.update_idletasks()
             
             # Check if video already exists
-            if os.path.exists(video_file):
+            had_video = os.path.exists(video_file)
+            if had_video:
                 # If skip_all_existing is set, don't ask and just skip
                 if self.skip_all_existing:
                     self.log(f"Skipping {song_folder} (video already exists - Skip All active)")
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 
@@ -337,11 +451,13 @@ class CloneHeroVideoDownloader:
                 
                 if response == "skip":
                     self.log(f"Skipping {song_folder} (video already exists)")
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 elif response == "skip_all":
                     self.log(f"Skipping {song_folder} and all remaining songs with existing videos")
                     self.skip_all_existing = True
+                    self.run_video_sync(song_folder, song_path)
                     i += 1
                     continue
                 elif response == "stop":
@@ -353,7 +469,9 @@ class CloneHeroVideoDownloader:
             try:
                 # Download video from YouTube
                 success = self.download_video(song_folder, song_path)
-                if not success:
+                if success:
+                    self.run_video_sync(song_folder, song_path, video_replaced=had_video)
+                else:
                     self.log(f"Failed to process {song_folder}. Moving to next song.")
             except Exception as e:
                 self.log(f"Error processing {song_folder}: {str(e)}")
@@ -481,6 +599,90 @@ class CloneHeroVideoDownloader:
         # Just return the cleaned folder name without adding any keywords
         return cleaned
     
+    def get_cookie_args(self):
+        """yt-dlp args to authenticate as the logged-in browser user.
+
+        Needed for age-restricted videos, which yt-dlp otherwise can't
+        fetch full formats for without some form of login.
+
+        An exported cookies.txt file takes priority over reading a
+        browser's live cookie store directly, since the latter can fail
+        to decrypt on Windows when Chrome uses App-Bound Encryption.
+        """
+        if self.cookies_file_path:
+            return ["--cookies", self.cookies_file_path]
+        if self.cookies_browser:
+            return ["--cookies-from-browser", self.cookies_browser]
+        return []
+
+    def get_extractor_args(self):
+        """Combined extra args every yt-dlp invocation should get.
+
+        --js-runtimes node: YouTube now requires solving a JS signature/"n"
+        challenge to get real (non-thumbnail-only) formats. yt-dlp needs an
+        external JS runtime to do this (see yt-dlp wiki page "EJS"); Deno is
+        the default but Node also works and is more commonly preinstalled.
+        """
+        return [*self.get_cookie_args(), "--js-runtimes", "node"]
+
+    def get_vp8_quality_settings(self):
+        """CRF target + max-bitrate ceiling for the WebM conversion, scaled
+        to the selected download resolution (self.video_quality)."""
+        settings = {
+            "1080": ("24", "8M"),
+            "720": ("26", "5M"),
+            "480": ("28", "2.5M"),
+            "360": ("30", "1.5M"),
+        }
+        return settings.get(self.video_quality, ("26", "4M"))
+
+    def get_pad_to_16x9_filter(self, width, height):
+        """ffmpeg -vf filter that fits the source into a WxH 16:9 canvas
+        without distorting it, padding with black bars on whichever sides
+        are needed (sides for vertical/portrait sources, top/bottom for
+        ultra-wide ones). Without this, YARG/Clone Hero crop a non-16:9
+        video to fill the screen instead of showing the whole frame."""
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+
+    def run_video_sync(self, song_name, song_path, video_replaced=False):
+        """Estimate and write video_start_time for one song folder. Never
+        raises: a sync problem shouldn't count as a failed download."""
+        if not self.auto_sync:
+            return
+        self.update_status(f"Syncing video offset: {song_name}")
+        try:
+            result = sync_video.sync_folder(song_path, apply=True,
+                                            overwrite=self.sync_overwrite,
+                                            min_prominence=self.sync_min_prominence,
+                                            ffmpeg=self.ffmpeg_path)
+        except Exception as e:
+            self.log(f"Video sync error: {e}")
+            self.sync_flagged.append((song_name, f"error: {e}"))
+            return
+
+        if result.status == "ok":
+            self.log(f"Video sync: wrote video_start_time = {result.offset_ms} ms "
+                     f"(confidence {result.prominence:.1f})")
+        elif result.status == "low-confidence":
+            self.log(f"Video sync: low confidence ({result.prominence:.1f}) - estimated "
+                     f"{result.offset_ms} ms was NOT written, check manually")
+            self.sync_flagged.append((song_name, f"low confidence, estimated {result.offset_ms} ms"))
+        elif result.status == "skipped-existing":
+            if video_replaced:
+                # The old offset was measured against the previous video file
+                self.log("Video sync: kept existing video_start_time, but the video was just replaced "
+                         "so it may no longer match - tick 'Overwrite existing' to recalculate")
+            else:
+                self.log("Video sync: song.ini already has video_start_time, skipped")
+        elif result.status == "missing-files":
+            self.log(f"Video sync: skipped ({result.message})")
+        else:
+            self.log(f"Video sync error: {result.message}")
+            self.sync_flagged.append((song_name, f"error: {result.message}"))
+
     def download_video(self, song_name, song_path):
         self.log(f"Processing: {song_name}")
         
@@ -510,13 +712,18 @@ class CloneHeroVideoDownloader:
             video_results = self.get_search_results(search_query)
             
             if not video_results:
-                self.log(f"No videos found for {song_name}")
-                return False
-            
+                self.log(f"No videos found automatically for {song_name}")
+                if self.auto_fetch:
+                    # No one is watching to answer a dialog in auto-fetch mode
+                    return False
+                selected_video = self.show_no_results_dialog(song_name)
+                if not selected_video or selected_video == "cancel":
+                    self.log("No URL supplied, skipping")
+                    return False
             # Show results to user if not in auto-fetch mode
-            if not self.auto_fetch and len(video_results) > 1:
+            elif not self.auto_fetch and len(video_results) > 1:
                 selected_video = self.show_video_selection(video_results, song_name)
-                if not selected_video:
+                if not selected_video or selected_video == "cancel":
                     self.log("Video selection canceled by user")
                     return False
             else:
@@ -534,27 +741,42 @@ class CloneHeroVideoDownloader:
             # Convert to WebM with VP8 codec
             self.log("Converting to WebM with VP8 codec...")
             output_file = os.path.join(song_path, "video.webm")
-            
+
             # Reset skip flag before starting conversions
             self.skip_conversion = False
-            
+
+            # CRF (Constant Quality) target and a generous max-bitrate ceiling,
+            # scaled to the selected download resolution. A flat low bitrate
+            # (e.g. 1M) at 1080p badly under-allocates data for the pixel count
+            # and looks like upscaled 720p; CRF lets the encoder spend more
+            # bits on complex frames while still capping worst-case size.
+            crf, max_bitrate = self.get_vp8_quality_settings()
+
+            # Target resolution (used to pad non-16:9 sources instead of
+            # letting YARG/Clone Hero crop them to fill the screen)
+            target_resolutions = {"1080": (1920, 1080), "720": (1280, 720),
+                                   "480": (854, 480), "360": (640, 360)}
+            target_w, target_h = target_resolutions.get(self.video_quality, (1280, 720))
+            pad_filter = self.get_pad_to_16x9_filter(target_w, target_h)
+
             # Define conversion options to try
             conversion_options = [
-                # Option 1: Fast conversion with reasonable quality - using stderr for progress
+                # Option 1: Good quality constant-quality encode at full resolution
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "libvpx", "-c:a", "libvorbis",
-                    "-b:v", "1M", "-b:a", "128k",
-                    "-deadline", "good", "-cpu-used", "4",  # Increased CPU usage for speed
+                    "-vf", pad_filter,
+                    "-crf", crf, "-b:v", max_bitrate, "-b:a", "128k",
+                    "-deadline", "good", "-cpu-used", "2",
                     output_file
                 ],
                 # Option 2: More compatible settings with lower quality
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "libvpx", "-c:a", "libvorbis",
-                    "-b:v", "800k", "-b:a", "128k",
-                    "-deadline", "realtime", "-cpu-used", "8",  # Fastest settings
-                    "-vf", "scale=640:360",  # Lower resolution for faster encoding
+                    "-crf", "30", "-b:v", "1.5M", "-b:a", "128k",
+                    "-deadline", "good", "-cpu-used", "4",
+                    "-vf", self.get_pad_to_16x9_filter(640, 360),  # Lower resolution for faster encoding
                     "-threads", "4",
                     output_file
                 ],
@@ -562,8 +784,8 @@ class CloneHeroVideoDownloader:
                 [
                     self.ffmpeg_path, "-y", "-i", downloaded_file,
                     "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
-                    "-b:v", "500k", "-b:a", "96k",
-                    "-vf", "scale=640:360",
+                    "-crf", "32", "-b:v", "1M", "-b:a", "96k",
+                    "-vf", self.get_pad_to_16x9_filter(640, 360),
                     output_file
                 ]
             ]
@@ -736,7 +958,7 @@ class CloneHeroVideoDownloader:
                                 "-c:v", "vp8", "-c:a", "libvorbis",  # Try vp8 instead of libvpx
                                 "-b:v", "800k", "-b:a", "128k",
                                 "-deadline", "good",
-                                "-vf", "scale=640:360",
+                                "-vf", self.get_pad_to_16x9_filter(640, 360),
                                 output_file
                             ]
                             self.log("Trying alternative codec conversion...")
@@ -766,7 +988,7 @@ class CloneHeroVideoDownloader:
                     final_cmd = [
                         self.ffmpeg_path, "-y", "-i", downloaded_file,
                         "-c:v", "libvpx", "-c:a", "libvorbis",
-                        "-vf", "scale=640:360",  # Low resolution
+                        "-vf", self.get_pad_to_16x9_filter(640, 360),  # Low resolution
                         "-b:v", "500k", "-b:a", "96k",  # Low bitrate
                         "-deadline", "realtime", "-cpu-used", "16",  # Fastest possible encoding
                         "-threads", "4", 
@@ -824,11 +1046,12 @@ class CloneHeroVideoDownloader:
         self.log(f"Searching YouTube for top results...")
         
         cmd = [
-            "yt-dlp", "--no-download", 
+            "yt-dlp", "--no-download",
             "--print", "title",
             "--print", "id",
             "--print", "duration",
             "--print", "view_count",
+            *self.get_extractor_args(),
             search_query
         ]
         
@@ -965,27 +1188,7 @@ class CloneHeroVideoDownloader:
                 }
                 
                 select_video(custom_video)
-                
-            # Extract video ID from different YouTube URL formats
-            def extract_video_id(url):
-                import re
-                # Regular YouTube URL: https://www.youtube.com/watch?v=VIDEO_ID
-                match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                # Shortened URL: https://youtu.be/VIDEO_ID
-                match = re.search(r'youtu\.be/([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                # Embed URL: https://www.youtube.com/embed/VIDEO_ID
-                match = re.search(r'youtube\.com/embed/([a-zA-Z0-9_-]+)', url)
-                if match:
-                    return match.group(1)
-                
-                return None
-            
+
             # Create a card for each video option
             for i, video in enumerate(videos):
                 # Create a frame for each video with a nice card-like appearance
@@ -1116,6 +1319,102 @@ class CloneHeroVideoDownloader:
         self.dialog_active = False
         return result["video"]
 
+    def show_no_results_dialog(self, song_name):
+        """Shown when YouTube search returns nothing. Lets the user paste a
+        direct YouTube URL for this song instead of just skipping it."""
+        self.dialog_active = True
+        result = {"video": None}
+
+        def show_dialog():
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title(f"No Videos Found for {song_name}")
+            dialog.geometry("500x230")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.grid_columnconfigure(0, weight=1)
+
+            content_frame = ctk.CTkFrame(dialog)
+            content_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+            content_frame.grid_columnconfigure(0, weight=1)
+
+            title_label = ctk.CTkLabel(content_frame,
+                                    text=f"No search results found for '{song_name}'",
+                                    font=ctk.CTkFont(size=14, weight="bold"),
+                                    wraplength=440, justify="left")
+            title_label.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="w")
+
+            subtitle_label = ctk.CTkLabel(content_frame,
+                                    text="Paste a YouTube URL for this song, or skip it.",
+                                    font=ctk.CTkFont(size=12),
+                                    wraplength=440, justify="left")
+            subtitle_label.grid(row=1, column=0, padx=10, pady=(0, 15), sticky="w")
+
+            def select_video(video):
+                result["video"] = video
+                dialog.destroy()
+
+            def on_dialog_close():
+                if result["video"] is None:
+                    result["video"] = "cancel"
+                dialog.destroy()
+
+            def use_custom_url():
+                url = url_var.get().strip()
+                if not url:
+                    messagebox.showerror("Error", "Please enter a valid YouTube URL")
+                    return
+
+                video_id = extract_video_id(url)
+                if not video_id:
+                    messagebox.showerror("Error", "Invalid YouTube URL format")
+                    return
+
+                custom_video = {
+                    'title': 'Custom URL',
+                    'id': video_id,
+                    'url': f'https://www.youtube.com/watch?v={video_id}',
+                    'duration': 0,
+                    'view_count': 0,
+                    'custom': True
+                }
+                select_video(custom_video)
+
+            url_var = tk.StringVar()
+            url_entry = ctk.CTkEntry(content_frame,
+                                   textvariable=url_var,
+                                   width=440,
+                                   placeholder_text="https://www.youtube.com/watch?v=...")
+            url_entry.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+            url_entry.bind("<Return>", lambda e: use_custom_url())
+
+            button_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+            button_frame.grid(row=3, column=0, padx=10, pady=(10, 0), sticky="ew")
+            button_frame.grid_columnconfigure((0, 1), weight=1)
+
+            custom_btn = ctk.CTkButton(button_frame,
+                                     text="Use This URL",
+                                     command=use_custom_url)
+            custom_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+            skip_btn = ctk.CTkButton(button_frame,
+                                     text="Skip This Song",
+                                     command=lambda: select_video("cancel"),
+                                     fg_color=("#DB3E39", "#821D1A"))
+            skip_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+            dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+            url_entry.focus_set()
+
+            self.root.wait_window(dialog)
+
+        self.root.after(0, show_dialog)
+
+        while self.dialog_active and result["video"] is None:
+            time.sleep(0.1)
+
+        self.dialog_active = False
+        return result["video"]
+
     def download_selected_video(self, video, temp_dir, format_options):
         """Download the selected video"""
         self.log(f"Downloading selected video: {video['title']}")
@@ -1130,7 +1429,8 @@ class CloneHeroVideoDownloader:
             try:
                 # First verify the video exists and is downloadable
                 verify_cmd = [
-                    "yt-dlp", "--no-download", "--print", "title", 
+                    "yt-dlp", "--no-download", "--print", "title",
+                    *self.get_extractor_args(),
                     video_url
                 ]
                 if sys.platform == 'win32':
@@ -1147,6 +1447,8 @@ class CloneHeroVideoDownloader:
                     result = subprocess.run(verify_cmd, capture_output=True, text=True)
                 if not result.stdout.strip():
                     self.log(f"Error: The custom URL could not be verified or is not a valid YouTube video: {video_url}")
+                    if result.stderr.strip():
+                        self.log(f"yt-dlp stderr:\n{result.stderr.strip()[-1000:]}")
                     return None
                     
                 self.log(f"Custom URL verified. Found video: {result.stdout.strip()}")
@@ -1160,12 +1462,13 @@ class CloneHeroVideoDownloader:
             
             # Build the download command
             cmd = [
-                "yt-dlp", 
+                "yt-dlp",
                 "-f", format_option,
                 "--merge-output-format", "mp4",  # Target MP4 for initial download
                 "--no-playlist",
                 "--geo-bypass",
                 "--max-filesize", "100M",  # Limit file size to avoid huge downloads
+                *self.get_extractor_args(),
                 "-o", output_template,
                 video_url
             ]
@@ -1174,17 +1477,17 @@ class CloneHeroVideoDownloader:
             self.log(f"Downloading video at {self.video_quality}p...")
             if sys.platform == 'win32':
                 process = create_hidden_process(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
                     universal_newlines=True,
                     bufsize=1  # Line buffered
                 )
             else:
                 process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge so errors aren't lost in an unread pipe
                     universal_newlines=True,
                     bufsize=1  # Line buffered
                 )
@@ -1210,8 +1513,8 @@ class CloneHeroVideoDownloader:
             # Check if the download was successful
             if process.returncode != 0:
                 self.log(f"Download failed with exit code {process.returncode}")
-                error_info = "\n".join(download_output[-5:]) if download_output else "No output captured"
-                self.log(f"Download error details (last 5 lines):\n{error_info}")
+                error_info = "\n".join(download_output[-20:]) if download_output else "No output captured"
+                self.log(f"Download error details (last 20 lines):\n{error_info}")
                 continue
             
             # Find the downloaded video file
@@ -1241,6 +1544,10 @@ class CloneHeroVideoDownloader:
         self.progress_bar.set(100)
         self.update_status("Finished")
         self.log("Processing completed!")
+        if self.sync_flagged:
+            self.log(f"\nVideo sync needs manual review for {len(self.sync_flagged)} song(s):")
+            for song_name, reason in self.sync_flagged:
+                self.log(f"  - {song_name}: {reason}")
 
     def toggle_auto_fetch(self):
         self.auto_fetch = self.auto_fetch_var.get()

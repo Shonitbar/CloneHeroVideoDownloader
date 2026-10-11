@@ -8,8 +8,8 @@ from pathlib import Path
 
 def check_python_version():
     print("Checking Python version...")
-    if sys.version_info < (3, 6):
-        print("Error: Python 3.6 or higher is required")
+    if sys.version_info < (3, 10):
+        print("Error: Python 3.10 or higher is required")
         return False
     print(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} detected - OK")
     return True

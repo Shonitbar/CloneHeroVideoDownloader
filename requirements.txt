@@ -1,2 +1,5 @@
-yt-dlp>=2023.11.16
-customtkinter>=5.2.0 
+yt-dlp[default]>=2026.8.19
+customtkinter>=5.2.0
+# Optional: automatic video_start_time sync (sync_video.py)
+numpy
+scipy
